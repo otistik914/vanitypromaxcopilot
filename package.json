@@ -1,28 +1,29 @@
 {
   "name": "discord-vanity-sniper-pro",
-  "version": "2.0.0",
-  "description": "High-performance Discord vanity claiming system with webhook-driven architecture",
+  "version": "2.0.0-final",
+  "description": "Ultra-fast, webhook-driven Discord vanity claiming system with production-grade reliability",
   "main": "src/index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "NODE_ENV=development nodemon src/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "clean": "rm -rf logs/* vanity.db*"
   },
-  "keywords": ["discord", "vanity", "sniper", "webhook"],
+  "keywords": ["discord", "vanity", "sniper", "webhook", "fast"],
   "author": "otistik914",
   "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "express": "^4.18.2",
     "dotenv": "^16.3.1",
     "better-sqlite3": "^9.0.0",
     "p-queue": "^7.3.4",
-    "axios": "^1.5.0",
-    "crypto": "^1.0.1"
+    "axios": "^1.5.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }

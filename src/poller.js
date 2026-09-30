@@ -1,13 +1,21 @@
 const axios = require('axios');
+const https = require('https');
 const crypto = require('crypto');
 const { enqueueVanity } = require('./queue');
 const { logPoll } = require('./db');
 const logger = require('./logger');
 
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 5,
+  timeout: 6000,
+});
+
 let lastVanity = null;
 let pollCount = 0;
 let lastErrorTime = 0;
-let consoleErrorsRemaining = 3; // Only log first 3 consecutive errors
+let errorStreak = 0;
+const maxConsecutiveErrors = 3;
 
 async function pollGuildVanity() {
   const startTime = Date.now();
@@ -20,8 +28,11 @@ async function pollGuildVanity() {
         headers: {
           Authorization: `Bot ${process.env.DISCORD_TOKEN}`,
           'User-Agent': 'DiscordVanitySniperPro/2.0',
+          'Accept-Encoding': 'gzip',
         },
         timeout: 5000,
+        httpAgent: httpsAgent,
+        httpsAgent: httpsAgent,
       }
     );
 
@@ -29,56 +40,58 @@ async function pollGuildVanity() {
     const currentVanity = response.data?.code?.toLowerCase();
 
     if (currentVanity && currentVanity !== lastVanity) {
-      logger.info(`🎯 Vanity change detected in ${latency}ms: ${lastVanity} → ${currentVanity}`);
+      logger.info(`🎯 Vanity CHANGED in ${latency}ms: ${lastVanity || 'none'} → ${currentVanity}`);
       enqueueVanity(currentVanity, `poll-${Date.now()}`);
       logPoll(currentVanity, true, latency);
       lastVanity = currentVanity;
-      consoleErrorsRemaining = 3; // Reset error counter on success
-    } else if (pollCount % 60 === 0) {
-      // Log every 60 polls (every ~8 minutes at 8s interval)
-      logger.debug(`⏸️  No change in ${latency}ms (poll #${pollCount})`);
+      errorStreak = 0; // Reset on success
+    } else if (pollCount % 120 === 0) {
+      // Log every 120 polls (~16 min at 8s interval)
+      logger.debug(`📊 Poll check #${pollCount}: no change, latency ${latency}ms`);
     }
   } catch (err) {
     const latency = Date.now() - startTime;
     const now = Date.now();
 
-    // Only log first few consecutive errors
-    if (now - lastErrorTime > 60000) {
-      consoleErrorsRemaining = 3; // Reset counter if last error was >1 min ago
+    // Reset error counter if last error was >5 min ago
+    if (now - lastErrorTime > 300000) {
+      errorStreak = 0;
     }
 
     lastErrorTime = now;
+    errorStreak++;
 
-    if (consoleErrorsRemaining > 0) {
+    if (errorStreak <= maxConsecutiveErrors) {
       let errorMsg = `⚠️  Poll error (${latency}ms):`;
 
       if (err.response) {
         const status = err.response.status;
         const data = err.response.data || {};
-        errorMsg += ` HTTP ${status} - ${data.message || 'unknown'}`;
+        errorMsg += ` HTTP ${status}`;
+        if (data.message) errorMsg += ` - ${data.message}`;
         logPoll(null, false, latency, `HTTP_${status}`);
-      } else if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT') {
-        errorMsg += ` Network error: ${err.code}`;
+      } else if (err.code) {
+        errorMsg += ` ${err.code}`;
         logPoll(null, false, latency, err.code);
       } else {
         errorMsg += ` ${err.message}`;
-        logPoll(null, false, latency, 'CLIENT_ERROR');
+        logPoll(null, false, latency, 'UNKNOWN');
       }
 
       logger.warn(errorMsg);
-      consoleErrorsRemaining--;
-    } else if (pollCount % 60 === 0) {
-      // Log summary every 60 failed polls
-      logger.warn(`⚠️  Polling still experiencing errors (60+ consecutive, suppressing logs)`);
+    } else if (errorStreak === maxConsecutiveErrors + 1) {
+      logger.warn(`⚠️  Polling errors persisting (${errorStreak}+ errors), suppressing detailed logs`);
+    } else if (errorStreak % 60 === 0) {
+      logger.warn(`⚠️  Polling still experiencing errors (${errorStreak} consecutive, last: ${(now - lastErrorTime) / 1000 | 0}s ago)`);
     }
   }
 }
 
 function startPoller() {
   const interval = parseInt(process.env.POLL_INTERVAL_MS || '8000');
-  logger.info(`🔍 Poller starting with interval: ${interval}ms`);
+  logger.info(`🔍 Poller started with ${interval}ms interval`);
 
-  // Poll immediately on startup
+  // Poll immediately
   pollGuildVanity();
 
   // Then poll at regular intervals
