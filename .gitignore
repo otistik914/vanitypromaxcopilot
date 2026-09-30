@@ -2,8 +2,13 @@ node_modules/
 .env
 .env.local
 config.json
-logs/
+vanity.db
+vanity.db-shm
+vanity.db-wal
 *.log
+logs/
+dist/
+build/
 .DS_Store
-coverage/
-.cache/
+.vscode/
+.idea/
