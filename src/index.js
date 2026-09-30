@@ -1,12 +1,123 @@
-const { claimVanity } = require('./worker');
+#!/usr/bin/env node
+/**
+ * Discord Vanity Sniper Pro v2.0 - Final Production
+ * Proxyless Ultra-Fast Mode with Zero Configuration
+ */
+
+require('dotenv').config();
+const path = require('path');
+const cluster = require('cluster');
+const os = require('os');
+
+const { initDB, closeDB } = require('./db');
+const { startServer, stopServer } = require('./server');
+const { startWorker, stopWorker } = require('./worker');
+const { startPoller } = require('./poller');
 const logger = require('./logger');
 
-// Direct, proxyless, ultra-fast mode for Discord API calls
-// No HTTP proxy is required; all connections are direct and keep-alive optimized.
+let isShuttingDown = false;
 
-function startProxylessMode() {
-  logger.info('🌐 Proxyless direct connection mode enabled');
-  logger.info('📡 Direct DNS + keep-alive + TLS session reuse enabled');
+function validateConfig() {
+  const required = ['DISCORD_TOKEN', 'DISCORD_GUILD_ID', 'WEBHOOK_SECRET'];
+  const missing = required.filter(v => !process.env[v]);
+  
+  if (missing.length > 0) {
+    logger.error(`Missing env vars: ${missing.join(', ')}`);
+    logger.error('Copy .env.example to .env and fill in your credentials');
+    process.exit(1);
+  }
+
+  if (process.env.WEBHOOK_SECRET.length < 32) {
+    logger.error('WEBHOOK_SECRET must be at least 32 characters');
+    process.exit(1);
+  }
 }
 
-module.exports = { startProxylessMode };
+async function main() {
+  validateConfig();
+
+  logger.info('🚀 Discord Vanity Sniper Pro v2.0 (Production Ready)');
+  logger.info(`🔧 Mode: ${process.env.NODE_ENV === 'production' ? 'Production' : 'Development'}`);
+  logger.info(`⚡ Latency target: 35-55ms (proxyless direct)`);
+  logger.info('');
+
+  try {
+    initDB();
+    logger.info('✅ Database initialized');
+  } catch (err) {
+    logger.error('Database init failed:', err.message);
+    process.exit(1);
+  }
+
+  if (process.env.NODE_ENV === 'production' && cluster.isMaster) {
+    const cpuCount = os.cpus().length;
+    logger.info(`🔄 Cluster mode: spawning ${cpuCount} workers`);
+    logger.info('');
+
+    for (let i = 0; i < cpuCount; i++) {
+      cluster.fork();
+    }
+
+    cluster.on('exit', (worker, code, signal) => {
+      if (!isShuttingDown) {
+        logger.warn(`Worker ${worker.process.pid} died (${signal || code}). Respawning...`);
+        cluster.fork();
+      }
+    });
+  } else {
+    await startServer();
+    logger.info(`✅ Server listening on port ${process.env.PORT || 3001}`);
+
+    startWorker();
+    logger.info('✅ Worker pool started (proxyless direct mode)');
+
+    startPoller();
+    logger.info('✅ Vanity poller started');
+
+    logger.info('');
+    logger.info('📊 Monitor with:');
+    logger.info(`   curl http://localhost:${process.env.PORT || 3001}/health`);
+    logger.info(`   curl http://localhost:${process.env.PORT || 3001}/stats`);
+  }
+}
+
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  logger.info(`\n⏹️  ${signal} received - graceful shutdown starting...`);
+
+  try {
+    await stopServer();
+    logger.info('✅ Server stopped');
+
+    await stopWorker();
+    logger.info('✅ Worker queue drained');
+
+    closeDB();
+    logger.info('✅ Database closed');
+
+    logger.info('✅ Shutdown complete');
+    process.exit(0);
+  } catch (err) {
+    logger.error('Shutdown error:', err.message);
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+process.on('uncaughtException', (err) => {
+  logger.error('💥 Uncaught Exception:', err);
+  gracefulShutdown('UNCAUGHT_EXCEPTION');
+});
+
+process.on('unhandledRejection', (reason) => {
+  logger.error('💥 Unhandled Rejection:', reason);
+});
+
+main().catch((err) => {
+  logger.error('Fatal error:', err);
+  process.exit(1);
+});

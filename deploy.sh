@@ -1,66 +1,83 @@
 #!/bin/bash
-# Production deployment script for Discord Vanity Sniper Pro
+# Discord Vanity Sniper Pro - One-Click Production Deploy
 
 set -e
 
-echo "🚀 Discord Vanity Sniper Pro - Production Deploy"
+echo ""
+echo "🚀 Discord Vanity Sniper Pro v2.0 - Production Deployment"
 echo ""
 
-# Check if .env exists
+# Validate .env
 if [ ! -f .env ]; then
-    echo "⚠️  .env file not found!"
-    echo "Please create .env file with required variables:"
-    echo "  DISCORD_TOKEN"
-    echo "  DISCORD_GUILD_ID"
-    echo "  WEBHOOK_SECRET"
+    echo "❌ Error: .env file not found!"
+    echo ""
+    echo "📝 Setup steps:"
+    echo "  1. cp .env.example .env"
+    echo "  2. Edit .env with your Discord credentials"
+    echo "  3. Run: bash deploy.sh"
     exit 1
 fi
 
 echo "✅ .env file found"
 echo ""
 
-# Stop existing containers
+# Check Docker
+if ! command -v docker-compose &> /dev/null; then
+    echo "❌ Docker Compose not installed!"
+    echo ""
+    echo "📦 Install from: https://docs.docker.com/compose/install/"
+    exit 1
+fi
+
+echo "✅ Docker Compose installed"
+echo ""
+
+# Stop existing
 echo "🛑 Stopping existing containers..."
-docker-compose down || true
-
-echo "✅ Containers stopped"
+docker-compose down 2>/dev/null || true
+echo "✅ Stopped"
 echo ""
 
-# Build image
-echo "�� Building Docker image..."
+# Build
+echo "🔨 Building Docker image (this may take a minute)..."
 docker-compose build --no-cache
-
-echo "✅ Image built"
+echo "✅ Built"
 echo ""
 
-# Start containers
-echo "🚀 Starting containers..."
+# Start
+echo "▶️  Starting service..."
 docker-compose up -d
-
-echo "✅ Containers started"
+echo "✅ Started"
 echo ""
 
-# Wait for health check
+# Wait for health
 echo "⏳ Waiting for service to be healthy..."
 sleep 5
 
-# Check health
-echo "🔍 Checking health..."
-if curl -f http://localhost:3001/health > /dev/null 2>&1; then
-    echo "✅ Service is healthy!"
-    echo ""
-    echo "🎉 Deployment successful!"
-    echo ""
-    echo "📄 Useful commands:"
-    echo "  View logs:        docker-compose logs -f"
-    echo "  Check stats:      curl http://localhost:3001/stats"
-    echo "  Health check:     curl http://localhost:3001/health"
-    echo "  Stop service:     docker-compose down"
-    echo "  Restart service:  docker-compose restart"
-else
-    echo "❌ Service failed to start!"
-    echo ""
-    echo "🔍 Debugging:"
-    docker-compose logs
-    exit 1
-fi
+for i in {1..30}; do
+    if curl -sf http://localhost:3001/health > /dev/null 2>&1; then
+        echo "✅ Service is healthy!"
+        echo ""
+        break
+    fi
+    if [ $i -eq 30 ]; then
+        echo "❌ Service failed to start!"
+        echo ""
+        echo "🔍 Debugging:"
+        docker-compose logs
+        exit 1
+    fi
+    sleep 1
+done
+
+echo "🎉 Deployment successful!"
+echo ""
+echo "📊 Quick commands:"
+echo "   Logs:      docker-compose logs -f"
+echo "   Health:    curl http://localhost:3001/health"
+echo "   Stats:     curl http://localhost:3001/stats"
+echo "   Benchmark: node scripts/benchmark.js"
+echo "   Stop:      docker-compose down"
+echo ""
+echo "📖 Full guide: https://github.com/otistik914/vanitypromaxcopilot/blob/main/DEPLOYMENT.md"
+echo ""
