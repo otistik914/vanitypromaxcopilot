@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  vanity-sniper:
+    build: .
+    container_name: discord-vanity-sniper
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - WORKER_CONCURRENCY=8
+      - CLAIM_INTERVAL_MS=1000
+      - POLL_INTERVAL_MS=5000
+      - PORT=3001
+      - LOG_LEVEL=info
+    volumes:
+      - ./logs:/app/logs
+      - ./vanity.db:/app/vanity.db
+    networks:
+      - vanity-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+networks:
+  vanity-network:
+    driver: bridge
+
+volumes:
+  logs:
+  database:
