@@ -1,0 +1,21 @@
+{
+  "discord": {
+    "token": "YOUR_DISCORD_TOKEN",
+    "password": "YOUR_DISCORD_PASSWORD",
+    "monitorToken": "YOUR_MONITOR_TOKEN"
+  },
+  "guild": {
+    "targetGuildId": "YOUR_SERVER_ID"
+  },
+  "notifications": {
+    "webhookUrl": "https://discord.com/api/webhooks/your/webhook",
+    "webhookUsername": "Vanity Monitor"
+  },
+  "behavior": {
+    "graceDays": 30,
+    "claimRetryLimit": 3,
+    "claimRetryDelayMs": 1500,
+    "gatewayReconnectDelayMs": 5000,
+    "heartbeatTimeoutMs": 30000
+  }
+}
