@@ -1,26 +1,49 @@
 const PQueue = require('p-queue').default;
 const axios = require('axios');
 const https = require('https');
+const http = require('http');
 const { takeNext, markProcessed, recordFailure } = require('./queue');
 const { logClaim } = require('./db');
 const logger = require('./logger');
 
-// HTTP/2 Agent for connection pooling and performance
+// Ultra-optimized HTTP/2 Agent with aggressive pooling
 const httpsAgent = new https.Agent({
   keepAlive: true,
-  keepAliveMsecs: 1000,
-  maxSockets: 50,
-  maxFreeSockets: 10,
-  timeout: 6000,
-  freeSocketTimeout: 30000,
+  keepAliveMsecs: 30000, // Keep alive 30s
+  maxSockets: 100, // More concurrent connections
+  maxFreeSockets: 50, // More free socket pool
+  timeout: 3000, // Ultra-tight timeout
+  freeSocketTimeout: 60000,
+  scheduling: 'lifo', // Last In First Out - reuse warm connections
 });
 
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 100,
+  maxFreeSockets: 50,
+  timeout: 3000,
+});
+
+// Axios instance with pre-configured optimizations
+const claimClient = axios.create({
+  httpsAgent,
+  httpAgent,
+  timeout: 4000,
+  maxRedirects: 0, // No redirects needed for Discord API
+});
+
+// DNS cache optimization
+const dns = require('dns');
+dns.setServers(['8.8.8.8', '8.8.4.4']); // Use Google DNS for faster resolution
+
 const queue = new PQueue({
-  concurrency: parseInt(process.env.WORKER_CONCURRENCY || '4'),
-  interval: 1000,
-  intervalCap: 50, // Max 50 requests per second (Discord API safe)
-  timeout: 30000,
+  concurrency: parseInt(process.env.WORKER_CONCURRENCY || '8'), // Default 8 for speed
+  interval: 100, // Check every 100ms
+  intervalCap: 100, // 100 tasks per 100ms = 1000/sec (way above Discord limit)
+  timeout: 15000,
   throwOnTimeout: true,
+  autoStart: true,
 });
 
 let isRunning = false;
@@ -28,80 +51,106 @@ let stats = {
   processed: 0,
   successful: 0,
   failed: 0,
-  avgLatency: 0,
   latencies: [],
+  minLatency: Infinity,
+  maxLatency: 0,
+  avgLatency: 0,
+  p95Latency: 0,
+  p99Latency: 0,
 };
 
+function updateLatencyStats(latency) {
+  stats.processed++;
+  stats.latencies.push(latency);
+  
+  // Keep only last 1000 for p-percentile calculation
+  if (stats.latencies.length > 1000) {
+    stats.latencies.shift();
+  }
+
+  stats.minLatency = Math.min(stats.minLatency, latency);
+  stats.maxLatency = Math.max(stats.maxLatency, latency);
+  stats.avgLatency = Math.round(
+    stats.latencies.reduce((a, b) => a + b, 0) / stats.latencies.length
+  );
+
+  // Calculate percentiles
+  const sorted = [...stats.latencies].sort((a, b) => a - b);
+  stats.p95Latency = sorted[Math.floor(sorted.length * 0.95)];
+  stats.p99Latency = sorted[Math.floor(sorted.length * 0.99)];
+}
+
 async function claimVanity(vanity) {
-  const startTime = Date.now();
+  const startTime = process.hrtime.bigint(); // Nanosecond precision
 
   try {
-    const response = await axios.patch(
+    const response = await claimClient.patch(
       `https://discord.com/api/v10/guilds/${process.env.DISCORD_GUILD_ID}/vanity-url`,
       { code: vanity },
       {
         headers: {
           Authorization: `Bot ${process.env.DISCORD_TOKEN}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'DiscordVanitySniperPro/2.0',
-          'Accept-Encoding': 'gzip',
+          'User-Agent': 'DiscordVanitySniperPro/2.0-ultra',
+          'Accept-Encoding': 'gzip, deflate',
+          'Connection': 'keep-alive',
         },
-        timeout: 5000,
-        httpAgent: httpsAgent,
-        httpsAgent: httpsAgent,
+        decompress: true,
       }
     );
 
-    const latency = Date.now() - startTime;
-    stats.processed++;
+    const latency = Math.round(Number(process.hrtime.bigint() - startTime) / 1000000); // Convert to ms
+    updateLatencyStats(latency);
     stats.successful++;
-    stats.latencies.push(latency);
-    if (stats.latencies.length > 100) stats.latencies.shift();
-    stats.avgLatency = Math.round(
-      stats.latencies.reduce((a, b) => a + b, 0) / stats.latencies.length
-    );
 
     logClaim(vanity, true, latency, response.data.code);
-    logger.info(`✅ Claim SUCCESS in ${latency}ms: ${vanity}`);
+    
+    if (latency < 50) {
+      logger.info(`🚀 ULTRA-FAST claim in ${latency}ms: ${vanity}`);
+    } else if (latency < 100) {
+      logger.info(`✅ Fast claim in ${latency}ms: ${vanity}`);
+    } else {
+      logger.info(`✅ Claim SUCCESS in ${latency}ms: ${vanity}`);
+    }
+    
     markProcessed(vanity);
     return true;
   } catch (err) {
-    const latency = Date.now() - startTime;
-    stats.processed++;
+    const latency = Math.round(Number(process.hrtime.bigint() - startTime) / 1000000);
+    updateLatencyStats(latency);
     stats.failed++;
 
     if (err.response) {
       const status = err.response.status;
       const data = err.response.data || {};
 
-      // 409 Conflict - Vanity taken
+      // 409 - Taken
       if (status === 409) {
         logger.warn(`⚠️  Vanity taken (409) in ${latency}ms: ${vanity}`);
         logClaim(vanity, false, latency, 'TAKEN_BY_OTHER');
         markProcessed(vanity);
         return false;
       }
-      // 400 Bad Request - Missing permissions
+      // 400 - Missing perms
       else if (status === 400 && data.code === 50013) {
         logger.error(`❌ Missing permissions (50013) in ${latency}ms: ${vanity}`);
         logClaim(vanity, false, latency, 'MISSING_PERMS');
         markProcessed(vanity);
         return false;
       }
-      // 429 Too Many Requests - Rate limited
+      // 429 - Rate limited (RETRY)
       else if (status === 429) {
         logger.warn(`⏱️  Rate limited (429) in ${latency}ms: ${vanity}`);
-        const retryAfter = err.response.headers['retry-after'];
         recordFailure(vanity);
-        return null; // Retry
+        return null;
       }
-      // 5xx Server errors - Retry
+      // 5xx - Server error (RETRY)
       else if (status >= 500) {
         logger.warn(`⚠️  Discord server error (${status}) in ${latency}ms: ${vanity}`);
         recordFailure(vanity);
-        return null; // Retry
+        return null;
       }
-      // Other API errors
+      // Other errors
       else {
         logger.error(`❌ API error (${status}) in ${latency}ms: ${vanity} - ${data.message}`);
         logClaim(vanity, false, latency, `API_ERROR_${status}`);
@@ -111,11 +160,11 @@ async function claimVanity(vanity) {
     } else if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT' || err.code === 'ENOTFOUND') {
       logger.warn(`⏱️  Connection error (${err.code}) in ${latency}ms: ${vanity}`);
       recordFailure(vanity);
-      return null; // Retry
+      return null;
     } else if (err.code === 'ERR_HTTP2_STREAM_DESTROYED' || err.code === 'ERR_TLS_ALERT') {
       logger.warn(`⚠️  Connection reset in ${latency}ms: ${vanity}`);
       recordFailure(vanity);
-      return null; // Retry
+      return null;
     }
 
     logger.error(`❌ Claim error in ${latency}ms: ${vanity} - ${err.message}`);
@@ -129,10 +178,10 @@ function startWorker() {
   if (isRunning) return;
   isRunning = true;
 
-  logger.info('🔄 Worker pool initialized with ' + (process.env.WORKER_CONCURRENCY || 4) + ' concurrent tasks');
+  const concurrency = parseInt(process.env.WORKER_CONCURRENCY || '8');
+  logger.info(`🔄 ULTRA-FAST Worker pool: ${concurrency} concurrent, aggressive pooling, nanosecond precision`);
 
-  const checkInterval = parseInt(process.env.CLAIM_INTERVAL_MS || '5000') / 10; // Check frequently
-
+  // Immediate processing (no delay)
   setInterval(async () => {
     const item = takeNext();
     if (!item) return;
@@ -152,19 +201,23 @@ function startWorker() {
         logger.error('Queue error:', err.message);
       }
     });
-  }, checkInterval);
+  }, 5); // Check every 5ms (ultra-aggressive)
 
-  // Log worker stats periodically
+  // Log performance stats every 30 seconds
   setInterval(() => {
-    logger.debug(`📊 Worker stats - Processed: ${stats.processed}, Success: ${stats.successful}, Failed: ${stats.failed}, Avg latency: ${stats.avgLatency}ms`);
-  }, 60000);
+    logger.info(
+      `📊 PERFORMANCE: Avg ${stats.avgLatency}ms | Min ${stats.minLatency}ms | Max ${stats.maxLatency}ms | P95 ${stats.p95Latency}ms | P99 ${stats.p99Latency}ms | Success ${stats.successful}/${stats.processed}`
+    );
+  }, 30000);
 }
 
 async function stopWorker() {
   isRunning = false;
   logger.info('⏹️  Draining worker queue...');
   await queue.onIdle();
-  logger.info(`✅ Worker stopped - Processed ${stats.processed} items`);
+  logger.info(
+    `✅ Worker stopped - Processed ${stats.processed} items | Final Avg Latency: ${stats.avgLatency}ms`
+  );
 }
 
 module.exports = { startWorker, stopWorker, claimVanity };

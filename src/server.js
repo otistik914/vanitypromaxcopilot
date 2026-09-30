@@ -46,7 +46,7 @@ app.use((req, res, next) => {
   requests.push(now);
   ipRequests.set(ip, requests);
 
-  if (requests.length > 1000) {
+  if (requests.length > 2000) {
     logger.warn(`⚠️  Rate limit exceeded for ${ip} (${requests.length} req/min)`);
     return res.status(429).json({ error: 'too many requests' });
   }
@@ -130,7 +130,7 @@ app.post('/webhooks/vanity', (req, res) => {
     const queued = enqueueVanity(vanity, eventId || crypto.randomUUID());
 
     if (queued) {
-      logger.info(`📝 Vanity queued: ${vanity} (${eventId})`);
+      logger.info(`📝 Vanity queued: ${vanity}`);
       return res.status(202).json({
         ok: true,
         queued: true,
@@ -150,6 +150,13 @@ app.post('/webhooks/vanity', (req, res) => {
     logger.error('Webhook error:', err.message);
     return res.status(400).json({ error: 'bad request', code: 'BAD_REQUEST' });
   }
+});
+
+// Performance stats (real-time)
+app.get('/stats/perf', (req, res) => {
+  const { getWorkerStats } = require('./worker');
+  const stats = getWorkerStats();
+  res.json(stats);
 });
 
 // Advanced stats for debugging
