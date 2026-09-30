@@ -1,6 +1,5 @@
 const Database = require('better-sqlite3');
 const path = require('path');
-const fs = require('fs');
 const logger = require('./logger');
 
 const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'vanity.db');
@@ -12,12 +11,13 @@ function initDB() {
     db.pragma('journal_mode = WAL');
     db.pragma('synchronous = NORMAL');
     db.pragma('cache_size = -64000');
+    db.pragma('temp_store = MEMORY');
+    db.pragma('foreign_keys = ON');
 
-    // Claims table
     db.exec(`
       CREATE TABLE IF NOT EXISTS claims (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        vanity TEXT NOT NULL,
+        vanity TEXT NOT NULL COLLATE NOCASE,
         success INTEGER NOT NULL,
         latency INTEGER,
         result TEXT,
@@ -25,23 +25,32 @@ function initDB() {
         UNIQUE(vanity, timestamp)
       );
       CREATE INDEX IF NOT EXISTS idx_claims_vanity ON claims(vanity);
+      CREATE INDEX IF NOT EXISTS idx_claims_success ON claims(success);
       CREATE INDEX IF NOT EXISTS idx_claims_timestamp ON claims(timestamp DESC);
     `);
 
-    // Polls table
     db.exec(`
       CREATE TABLE IF NOT EXISTS polls (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        vanity TEXT,
+        vanity TEXT COLLATE NOCASE,
         success INTEGER NOT NULL,
         latency INTEGER,
         error_type TEXT,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
       );
+      CREATE INDEX IF NOT EXISTS idx_polls_success ON polls(success);
       CREATE INDEX IF NOT EXISTS idx_polls_timestamp ON polls(timestamp DESC);
     `);
 
-    logger.info(`✅ Database initialized at: ${dbPath}`);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS stats_cache (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    logger.info(`✅ Database ready: ${dbPath}`);
   } catch (err) {
     logger.error('Database error:', err.message);
     throw err;
@@ -81,13 +90,11 @@ function isClaimSuccess(vanity) {
 
   try {
     const stmt = db.prepare(`
-      SELECT success FROM claims
+      SELECT 1 FROM claims
       WHERE vanity = ? AND success = 1
-      ORDER BY timestamp DESC
       LIMIT 1
     `);
-    const result = stmt.get(vanity.toLowerCase());
-    return !!result;
+    return !!stmt.get(vanity.toLowerCase());
   } catch (err) {
     logger.error('Failed to check claim success:', err.message);
     return false;
@@ -98,20 +105,21 @@ function getStats() {
   if (!db) return null;
 
   try {
-    const claimsStmt = db.prepare(`
+    const claims24h = db.prepare(`
       SELECT COUNT(*) as total, SUM(success) as successful, AVG(latency) as avgLatency
       FROM claims
       WHERE timestamp > datetime('now', '-24 hours')
-    `);
-    const pollsStmt = db.prepare(`
+    `).get();
+
+    const polls24h = db.prepare(`
       SELECT COUNT(*) as total, SUM(success) as successful, AVG(latency) as avgLatency
       FROM polls
       WHERE timestamp > datetime('now', '-24 hours')
-    `);
+    `).get();
 
     return {
-      claims: claimsStmt.get(),
-      polls: pollsStmt.get(),
+      claims: claims24h,
+      polls: polls24h,
     };
   } catch (err) {
     logger.error('Failed to get stats:', err.message);
@@ -119,12 +127,34 @@ function getStats() {
   }
 }
 
-function closeDB() {
-  if (db) {
-    db.close();
-    db = null;
+function cleanup() {
+  if (!db) return;
+
+  try {
+    db.prepare(`DELETE FROM claims WHERE timestamp < datetime('now', '-30 days')`).run();
+    db.prepare(`DELETE FROM polls WHERE timestamp < datetime('now', '-7 days')`).run();
+    db.exec('VACUUM;');
+    logger.info('✅ Database cleanup completed');
+  } catch (err) {
+    logger.error('Database cleanup error:', err.message);
   }
 }
+
+function closeDB() {
+  if (db) {
+    try {
+      db.close();
+      db = null;
+      logger.info('✅ Database connection closed');
+    } catch (err) {
+      logger.error('Error closing database:', err.message);
+    }
+  }
+}
+
+setInterval(() => {
+  cleanup();
+}, 24 * 60 * 60 * 1000);
 
 module.exports = {
   initDB,
@@ -132,5 +162,7 @@ module.exports = {
   logPoll,
   isClaimSuccess,
   getStats,
+  cleanup,
   closeDB,
 };
+

@@ -4,7 +4,8 @@ const logger = require('./logger');
 class VanityQueue {
   constructor() {
     this.queue = [];
-    this.seen = new Map(); // vanity -> { timestamp, eventId, retries }
+    this.processing = new Set();
+    this.seen = new Map();
     this.dedupeWindow = parseInt(process.env.DEDUPE_TTL_MS || '60000');
     this.maxRetries = 5;
     this.maxQueueSize = parseInt(process.env.QUEUE_MAX_SIZE || '1000');
@@ -16,48 +17,43 @@ class VanityQueue {
     const vanityLower = vanity.toLowerCase();
     const now = Date.now();
 
-    // Check if already processed recently
     if (this.seen.has(vanityLower)) {
       const entry = this.seen.get(vanityLower);
-      const age = now - entry.timestamp;
-
-      if (age < this.dedupeWindow) {
-        // Still in dedupe window
+      if (now - entry.timestamp < this.dedupeWindow) {
         return false;
       }
     }
 
-    // Check queue size
     if (this.queue.length >= this.maxQueueSize) {
       logger.warn(`⚠️  Queue full (${this.maxQueueSize}), dropping: ${vanity}`);
       return false;
     }
 
-    // Add to queue
-    this.queue.push({
+    const queueItem = {
       vanity: vanityLower,
       eventId: eventId || crypto.randomUUID(),
       timestamp: now,
       retries: 0,
       addedAt: now,
-    });
+    };
 
-    // Update seen map
-    this.seen.set(vanityLower, {
-      timestamp: now,
-      eventId,
-      retries: 0,
-    });
+    this.queue.push(queueItem);
+    this.seen.set(vanityLower, queueItem);
 
     return true;
   }
 
   dequeue() {
-    return this.queue.shift();
+    const item = this.queue.shift();
+    if (item) {
+      this.processing.add(item.vanity);
+    }
+    return item;
   }
 
   markProcessed(vanity) {
     const vanityLower = vanity.toLowerCase();
+    this.processing.delete(vanityLower);
     this.seen.delete(vanityLower);
   }
 
@@ -68,16 +64,10 @@ class VanityQueue {
     if (entry) {
       if (entry.retries < this.maxRetries) {
         entry.retries++;
-        // Re-queue with delay
-        this.queue.push({
-          vanity: vanityLower,
-          eventId: entry.eventId,
-          timestamp: Date.now(),
-          retries: entry.retries,
-          addedAt: Date.now(),
-        });
+        entry.timestamp = Date.now();
+        this.queue.push(entry);
       } else {
-        logger.error(`❌ Max retries exceeded for: ${vanity}`);
+        logger.error(`❌ Max retries (${this.maxRetries}) exceeded: ${vanity}`);
         this.markProcessed(vanity);
       }
     }
@@ -87,17 +77,19 @@ class VanityQueue {
     return {
       queueSize: this.queue.length,
       maxSize: this.maxQueueSize,
+      processing: this.processing.size,
       seenEntries: this.seen.size,
       dedupeWindow: this.dedupeWindow,
       nextItem: this.queue.length > 0 ? this.queue[0].vanity : null,
     };
   }
 
-  // Cleanup old entries from seen map
   cleanup() {
     const now = Date.now();
+    const deadlineTime = now - (this.dedupeWindow * 2);
+
     for (const [vanity, entry] of this.seen.entries()) {
-      if (now - entry.timestamp > this.dedupeWindow * 2) {
+      if (entry.timestamp < deadlineTime) {
         this.seen.delete(vanity);
       }
     }
@@ -106,7 +98,6 @@ class VanityQueue {
 
 const vanityQueue = new VanityQueue();
 
-// Cleanup every 5 minutes
 setInterval(() => {
   vanityQueue.cleanup();
 }, 5 * 60 * 1000);
@@ -118,3 +109,4 @@ module.exports = {
   recordFailure: (vanity) => vanityQueue.recordFailure(vanity),
   getQueueStats: () => vanityQueue.getStats(),
 };
+

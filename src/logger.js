@@ -11,7 +11,6 @@ const LOG_LEVELS = {
 const logLevel = LOG_LEVELS[process.env.LOG_LEVEL || 'info'];
 const logsDir = path.join(__dirname, '..', 'logs');
 
-// Ensure logs directory exists
 if (!fs.existsSync(logsDir)) {
   fs.mkdirSync(logsDir, { recursive: true });
 }
@@ -19,8 +18,7 @@ if (!fs.existsSync(logsDir)) {
 const logFile = path.join(logsDir, `vanity-${new Date().toISOString().split('T')[0]}.log`);
 
 function formatTime() {
-  const now = new Date();
-  return now.toISOString();
+  return new Date().toISOString();
 }
 
 function formatMessage(level, message, data) {
@@ -71,3 +69,4 @@ const logger = {
 };
 
 module.exports = logger;
+
