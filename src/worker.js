@@ -4,14 +4,16 @@ const https = require('https');
 const http = require('http');
 const { takeNext, markProcessed, recordFailure } = require('./queue');
 const { logClaim } = require('./db');
+const rateLimiter = require('./rate-limiter');
 const logger = require('./logger');
 
-// Ultra-optimized HTTP/2 Agent with aggressive pooling
+const targetGuildId = process.env.DISCORD_GUILD_ID;
+
 const httpsAgent = new https.Agent({
   keepAlive: true,
   keepAliveMsecs: 30000,
-  maxSockets: 100,
-  maxFreeSockets: 50,
+  maxSockets: 25,
+  maxFreeSockets: 10,
   timeout: 3000,
   freeSocketTimeout: 60000,
   scheduling: 'lifo',
@@ -20,8 +22,8 @@ const httpsAgent = new https.Agent({
 const httpAgent = new http.Agent({
   keepAlive: true,
   keepAliveMsecs: 30000,
-  maxSockets: 100,
-  maxFreeSockets: 50,
+  maxSockets: 25,
+  maxFreeSockets: 10,
   timeout: 3000,
 });
 
@@ -36,9 +38,9 @@ const dns = require('dns');
 dns.setServers(['8.8.8.8', '8.8.4.4']);
 
 const queue = new PQueue({
-  concurrency: parseInt(process.env.WORKER_CONCURRENCY || '8'),
-  interval: 100,
-  intervalCap: 100,
+  concurrency: parseInt(process.env.WORKER_CONCURRENCY || '2'),
+  interval: 1000,
+  intervalCap: parseInt(process.env.REQUESTS_PER_SECOND || '2'),
   timeout: 15000,
   throwOnTimeout: true,
   autoStart: true,
@@ -49,6 +51,7 @@ let stats = {
   processed: 0,
   successful: 0,
   failed: 0,
+  rateLimited: 0,
   latencies: [],
   minLatency: Infinity,
   maxLatency: 0,
@@ -72,22 +75,29 @@ function updateLatencyStats(latency) {
   );
 
   const sorted = [...stats.latencies].sort((a, b) => a - b);
-  stats.p95Latency = sorted[Math.floor(sorted.length * 0.95)];
-  stats.p99Latency = sorted[Math.floor(sorted.length * 0.99)];
+  stats.p95Latency = sorted[Math.floor(sorted.length * 0.95)] || 0;
+  stats.p99Latency = sorted[Math.floor(sorted.length * 0.99)] || 0;
 }
 
 async function claimVanity(vanity) {
+  if (!targetGuildId) {
+    logger.error('DISCORD_GUILD_ID is missing; cannot claim vanity on any guild');
+    return false;
+  }
+
+  await rateLimiter.wait();
+
   const startTime = process.hrtime.bigint();
 
   try {
     const response = await claimClient.patch(
-      `https://discord.com/api/v10/guilds/${process.env.DISCORD_GUILD_ID}/vanity-url`,
+      `https://discord.com/api/v10/guilds/${targetGuildId}/vanity-url`,
       { code: vanity },
       {
         headers: {
           Authorization: `Bot ${process.env.DISCORD_TOKEN}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'DiscordVanitySniperPro/2.0-ultra',
+          'User-Agent': 'DiscordVanitySniperPro/2.0-safe',
           'Accept-Encoding': 'gzip, deflate',
           Connection: 'keep-alive',
         },
@@ -95,14 +105,17 @@ async function claimVanity(vanity) {
       }
     );
 
+    rateLimiter.updateFromHeaders(response.headers || {});
+    rateLimiter.recordRequest();
+
     const latency = Math.round(Number(process.hrtime.bigint() - startTime) / 1000000);
     updateLatencyStats(latency);
     stats.successful++;
 
-    logClaim(vanity, true, latency, response.data.code);
+    logClaim(vanity, true, latency, response.data?.code || 'CLAIMED');
 
     if (latency < 50) {
-      logger.info(`🚀 ULTRA-FAST claim in ${latency}ms: ${vanity}`);
+      logger.info(`🚀 Claim succeeded in ${latency}ms: ${vanity}`);
     } else if (latency < 100) {
       logger.info(`✅ Fast claim in ${latency}ms: ${vanity}`);
     } else {
@@ -119,37 +132,51 @@ async function claimVanity(vanity) {
     if (err.response) {
       const status = err.response.status;
       const data = err.response.data || {};
+      const retryAfterHeader = err.response.headers?.['retry-after'];
+
+      if (status === 429) {
+        const retryAfter = Number(data.retry_after || retryAfterHeader || 1);
+        const waitMs = rateLimiter.handle429(retryAfter);
+        stats.rateLimited++;
+        logger.warn(`⏱️ Rate limited (429) in ${latency}ms: ${vanity}. Backoff ${Math.ceil(waitMs / 1000)}s`);
+        recordFailure(vanity);
+        return null;
+      }
 
       if (status === 409) {
-        logger.warn(`⚠️  Vanity taken (409) in ${latency}ms: ${vanity}`);
+        logger.warn(`⚠️ Vanity already taken (409) in ${latency}ms: ${vanity}`);
         logClaim(vanity, false, latency, 'TAKEN_BY_OTHER');
         markProcessed(vanity);
         return false;
-      } else if (status === 400 && data.code === 50013) {
+      }
+
+      if (status === 400 && data.code === 50013) {
         logger.error(`❌ Missing permissions (50013) in ${latency}ms: ${vanity}`);
         logClaim(vanity, false, latency, 'MISSING_PERMS');
         markProcessed(vanity);
         return false;
-      } else if (status === 429) {
-        logger.warn(`⏱️  Rate limited (429) in ${latency}ms: ${vanity}`);
-        recordFailure(vanity);
-        return null;
-      } else if (status >= 500) {
-        logger.warn(`⚠️  Discord server error (${status}) in ${latency}ms: ${vanity}`);
-        recordFailure(vanity);
-        return null;
-      } else {
-        logger.error(`❌ API error (${status}) in ${latency}ms: ${vanity} - ${data.message}`);
-        logClaim(vanity, false, latency, `API_ERROR_${status}`);
-        markProcessed(vanity);
-        return false;
       }
-    } else if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT' || err.code === 'ENOTFOUND') {
-      logger.warn(`⏱️  Connection error (${err.code}) in ${latency}ms: ${vanity}`);
+
+      if (status >= 500) {
+        logger.warn(`⚠️ Discord server error (${status}) in ${latency}ms: ${vanity}`);
+        recordFailure(vanity);
+        return null;
+      }
+
+      logger.error(`❌ API error (${status}) in ${latency}ms: ${vanity} - ${data.message || 'unknown'}`);
+      logClaim(vanity, false, latency, `API_ERROR_${status}`);
+      markProcessed(vanity);
+      return false;
+    }
+
+    if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT' || err.code === 'ENOTFOUND') {
+      logger.warn(`⏱️ Connection error (${err.code}) in ${latency}ms: ${vanity}`);
       recordFailure(vanity);
       return null;
-    } else if (err.code === 'ERR_HTTP2_STREAM_DESTROYED' || err.code === 'ERR_TLS_ALERT') {
-      logger.warn(`⚠️  Connection reset in ${latency}ms: ${vanity}`);
+    }
+
+    if (err.code === 'ERR_HTTP2_STREAM_DESTROYED' || err.code === 'ERR_TLS_ALERT') {
+      logger.warn(`⚠️ Connection reset in ${latency}ms: ${vanity}`);
       recordFailure(vanity);
       return null;
     }
@@ -165,8 +192,8 @@ function startWorker() {
   if (isRunning) return;
   isRunning = true;
 
-  const concurrency = parseInt(process.env.WORKER_CONCURRENCY || '8');
-  logger.info(`🔄 ULTRA-FAST Worker pool: ${concurrency} concurrent, aggressive pooling, nanosecond precision`);
+  const concurrency = parseInt(process.env.WORKER_CONCURRENCY || '2');
+  logger.info(`🔄 Rate-limit-safe Worker pool: ${concurrency} concurrent, backoff enabled`);
 
   setInterval(async () => {
     const item = takeNext();
@@ -181,29 +208,31 @@ function startWorker() {
       }
     }).catch((err) => {
       if (err.name === 'TimeoutError') {
-        logger.warn(`⏱️  Task timeout for ${item.vanity}`);
+        logger.warn(`⏱️ Task timeout for ${item.vanity}`);
         recordFailure(item.vanity);
       } else {
         logger.error('Queue error:', err.message);
       }
     });
-  }, 5);
+  }, 250);
 
   setInterval(() => {
+    const rateLimitStatus = rateLimiter.getStatus();
     logger.info(
-      `📊 PERFORMANCE: Avg ${stats.avgLatency}ms | Min ${stats.minLatency}ms | Max ${stats.maxLatency}ms | P95 ${stats.p95Latency}ms | P99 ${stats.p99Latency}ms | Success ${stats.successful}/${stats.processed}`
+      `📊 PERFORMANCE: Avg ${stats.avgLatency}ms | P95 ${stats.p95Latency}ms | P99 ${stats.p99Latency}ms | ` +
+      `Success ${stats.successful} | Failed ${stats.failed} | RateLimited ${stats.rateLimited} | ` +
+      `Status: ${rateLimitStatus.rateLimited ? '⏱️ THROTTLED' : '✅ OK'}`
     );
   }, 30000);
 }
 
 async function stopWorker() {
   isRunning = false;
-  logger.info('⏹️  Draining worker queue...');
+  logger.info('⏹️ Draining worker queue...');
   await queue.onIdle();
   logger.info(
-    `✅ Worker stopped - Processed ${stats.processed} items | Final Avg Latency: ${stats.avgLatency}ms`
+    `✅ Worker stopped - Processed ${stats.processed} items | Avg Latency: ${stats.avgLatency}ms`
   );
 }
 
 module.exports = { startWorker, stopWorker, claimVanity };
-
