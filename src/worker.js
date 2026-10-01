@@ -32,6 +32,7 @@ const claimClient = axios.create({
   httpAgent,
   timeout: 4000,
   maxRedirects: 0,
+  validateStatus: () => true,
 });
 
 const dns = require('dns');
@@ -81,7 +82,7 @@ function updateLatencyStats(latency) {
 
 async function claimVanity(vanity) {
   if (!targetGuildId) {
-    logger.error('DISCORD_GUILD_ID is missing; cannot claim vanity on any guild');
+    logger.error('❌ DISCORD_GUILD_ID is missing; cannot claim vanity on any guild');
     return false;
   }
 
@@ -105,83 +106,115 @@ async function claimVanity(vanity) {
       }
     );
 
+    const status = response.status;
+    const data = response.data || {};
+
     rateLimiter.updateFromHeaders(response.headers || {});
     rateLimiter.recordRequest();
 
     const latency = Math.round(Number(process.hrtime.bigint() - startTime) / 1000000);
     updateLatencyStats(latency);
-    stats.successful++;
 
-    logClaim(vanity, true, latency, response.data?.code || 'CLAIMED');
-
-    if (latency < 50) {
-      logger.info(`🚀 Claim succeeded in ${latency}ms: ${vanity}`);
-    } else if (latency < 100) {
-      logger.info(`✅ Fast claim in ${latency}ms: ${vanity}`);
-    } else {
-      logger.info(`✅ Claim SUCCESS in ${latency}ms: ${vanity}`);
+    if (status === 200) {
+      stats.successful++;
+      logClaim(vanity, true, latency, 'SUCCESS');
+      logger.info(`🚀 ✅ Claim SUCCESS in ${latency}ms: ${vanity}`);
+      markProcessed(vanity);
+      return true;
     }
 
+    if (status === 429) {
+      const retryAfter = Number(data.retry_after || response.headers?.['retry-after'] || 1);
+      const waitMs = rateLimiter.handle429(retryAfter);
+      stats.rateLimited++;
+      stats.failed++;
+      logger.warn(`⏱️ 429 Rate Limited (${latency}ms): ${vanity}. Backoff ${Math.ceil(waitMs / 1000)}s`);
+      recordFailure(vanity);
+      return null;
+    }
+
+    if (status === 409) {
+      stats.failed++;
+      logger.warn(`⚠️ 409 Conflict - Vanity already taken (${latency}ms): ${vanity}`);
+      logClaim(vanity, false, latency, 'CONFLICT_409');
+      markProcessed(vanity);
+      return false;
+    }
+
+    if (status === 401) {
+      stats.failed++;
+      logger.error(`❌ 401 Unauthorized (${latency}ms): Invalid or expired bot token`);
+      logClaim(vanity, false, latency, 'AUTH_FAILED_401');
+      markProcessed(vanity);
+      return false;
+    }
+
+    if (status === 403) {
+      stats.failed++;
+      logger.error(`❌ 403 Forbidden (${latency}ms): Bot lacks "Manage Guild" permission on guild ${targetGuildId}`);
+      logClaim(vanity, false, latency, 'FORBIDDEN_403');
+      markProcessed(vanity);
+      return false;
+    }
+
+    if (status === 404) {
+      stats.failed++;
+      logger.error(`❌ 404 Not Found (${latency}ms): Guild ${targetGuildId} not found or bot not in guild`);
+      logClaim(vanity, false, latency, 'GUILD_NOT_FOUND_404');
+      markProcessed(vanity);
+      return false;
+    }
+
+    if (status === 400 && data.code === 50013) {
+      stats.failed++;
+      logger.error(`❌ 400 Permission Error (50013) (${latency}ms): ${vanity}`);
+      logClaim(vanity, false, latency, 'MISSING_PERMS_50013');
+      markProcessed(vanity);
+      return false;
+    }
+
+    if (status >= 500) {
+      stats.failed++;
+      logger.warn(`⚠️ ${status} Server Error (${latency}ms): ${vanity}`);
+      recordFailure(vanity);
+      return null;
+    }
+
+    stats.failed++;
+    logger.error(`❌ API Error ${status} (${latency}ms): ${vanity} - ${data.message || 'unknown'}`);
+    logClaim(vanity, false, latency, `API_ERROR_${status}`);
     markProcessed(vanity);
-    return true;
+    return false;
   } catch (err) {
     const latency = Math.round(Number(process.hrtime.bigint() - startTime) / 1000000);
     updateLatencyStats(latency);
     stats.failed++;
 
-    if (err.response) {
-      const status = err.response.status;
-      const data = err.response.data || {};
-      const retryAfterHeader = err.response.headers?.['retry-after'];
-
-      if (status === 429) {
-        const retryAfter = Number(data.retry_after || retryAfterHeader || 1);
-        const waitMs = rateLimiter.handle429(retryAfter);
-        stats.rateLimited++;
-        logger.warn(`⏱️ Rate limited (429) in ${latency}ms: ${vanity}. Backoff ${Math.ceil(waitMs / 1000)}s`);
-        recordFailure(vanity);
-        return null;
-      }
-
-      if (status === 409) {
-        logger.warn(`⚠️ Vanity already taken (409) in ${latency}ms: ${vanity}`);
-        logClaim(vanity, false, latency, 'TAKEN_BY_OTHER');
-        markProcessed(vanity);
-        return false;
-      }
-
-      if (status === 400 && data.code === 50013) {
-        logger.error(`❌ Missing permissions (50013) in ${latency}ms: ${vanity}`);
-        logClaim(vanity, false, latency, 'MISSING_PERMS');
-        markProcessed(vanity);
-        return false;
-      }
-
-      if (status >= 500) {
-        logger.warn(`⚠️ Discord server error (${status}) in ${latency}ms: ${vanity}`);
-        recordFailure(vanity);
-        return null;
-      }
-
-      logger.error(`❌ API error (${status}) in ${latency}ms: ${vanity} - ${data.message || 'unknown'}`);
-      logClaim(vanity, false, latency, `API_ERROR_${status}`);
-      markProcessed(vanity);
-      return false;
+    if (err.code === 'ECONNREFUSED') {
+      logger.warn(`⏱️ Connection refused (${latency}ms): ${vanity} - Discord API unreachable`);
+      recordFailure(vanity);
+      return null;
     }
 
-    if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT' || err.code === 'ENOTFOUND') {
-      logger.warn(`⏱️ Connection error (${err.code}) in ${latency}ms: ${vanity}`);
+    if (err.code === 'ETIMEDOUT') {
+      logger.warn(`⏱️ Request timeout (${latency}ms): ${vanity}`);
+      recordFailure(vanity);
+      return null;
+    }
+
+    if (err.code === 'ENOTFOUND') {
+      logger.warn(`⏱️ DNS error (${latency}ms): ${vanity}`);
       recordFailure(vanity);
       return null;
     }
 
     if (err.code === 'ERR_HTTP2_STREAM_DESTROYED' || err.code === 'ERR_TLS_ALERT') {
-      logger.warn(`⚠️ Connection reset in ${latency}ms: ${vanity}`);
+      logger.warn(`⚠️ Connection reset (${latency}ms): ${vanity}`);
       recordFailure(vanity);
       return null;
     }
 
-    logger.error(`❌ Claim error in ${latency}ms: ${vanity} - ${err.message}`);
+    logger.error(`❌ Claim error (${latency}ms): ${vanity} - ${err.message}`);
     logClaim(vanity, false, latency, 'CLIENT_ERROR');
     markProcessed(vanity);
     return false;
@@ -193,7 +226,13 @@ function startWorker() {
   isRunning = true;
 
   const concurrency = parseInt(process.env.WORKER_CONCURRENCY || '2');
-  logger.info(`🔄 Rate-limit-safe Worker pool: ${concurrency} concurrent, backoff enabled`);
+  const hasToken = !!process.env.DISCORD_TOKEN;
+
+  logger.info(`🔄 Worker Pool Config:`);
+  logger.info(`   Concurrency: ${concurrency}`);
+  logger.info(`   Requests/sec: ${parseInt(process.env.REQUESTS_PER_SECOND || '2')}`);
+  logger.info(`   Bot Token: ${hasToken ? '✅ Set' : '❌ MISSING'}`);
+  logger.info(`   Guild ID: ${process.env.DISCORD_GUILD_ID || '❌ MISSING'}`);
 
   setInterval(async () => {
     const item = takeNext();
@@ -218,10 +257,14 @@ function startWorker() {
 
   setInterval(() => {
     const rateLimitStatus = rateLimiter.getStatus();
+    const rlInfo = rateLimitStatus.rateLimited 
+      ? `⏱️ THROTTLED (reset in ${Math.ceil(rateLimitStatus.resetIn / 1000)}s)` 
+      : '✅ OK';
+    
     logger.info(
-      `📊 PERFORMANCE: Avg ${stats.avgLatency}ms | P95 ${stats.p95Latency}ms | P99 ${stats.p99Latency}ms | ` +
+      `📊 Worker Stats: Avg ${stats.avgLatency}ms | P95 ${stats.p95Latency}ms | P99 ${stats.p99Latency}ms | ` +
       `Success ${stats.successful} | Failed ${stats.failed} | RateLimited ${stats.rateLimited} | ` +
-      `Status: ${rateLimitStatus.rateLimited ? '⏱️ THROTTLED' : '✅ OK'}`
+      `Status: ${rlInfo}`
     );
   }, 30000);
 }
