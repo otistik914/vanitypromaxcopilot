@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Discord Vanity Sniper Pro v2.0 - Final Production
- * Proxyless Ultra-Fast Mode with Zero Configuration
+ * Discord Vanity Sniper Pro v2.0 - User Token Edition
+ * Claims vanity URLs using user account token
  */
 
 require('dotenv').config();
@@ -18,12 +18,17 @@ const logger = require('./logger');
 let isShuttingDown = false;
 
 function validateConfig() {
-  const required = ['DISCORD_TOKEN', 'DISCORD_GUILD_ID', 'WEBHOOK_SECRET'];
+  const required = ['DISCORD_USER_TOKEN', 'DISCORD_GUILD_ID', 'WEBHOOK_SECRET'];
   const missing = required.filter(v => !process.env[v]);
   
   if (missing.length > 0) {
     logger.error(`Missing env vars: ${missing.join(', ')}`);
     logger.error('Copy .env.example to .env and fill in your credentials');
+    logger.error('');
+    logger.error('Required:');
+    logger.error('  DISCORD_USER_TOKEN - Your Discord user token (from DevTools)');
+    logger.error('  DISCORD_GUILD_ID - Target server ID (where to claim vanities)');
+    logger.error('  WEBHOOK_SECRET - Random string, min 32 characters');
     process.exit(1);
   }
 
@@ -36,9 +41,9 @@ function validateConfig() {
 async function main() {
   validateConfig();
 
-  logger.info('🚀 Discord Vanity Sniper Pro v2.0 (Production Ready)');
+  logger.info('🚀 Discord Vanity Sniper Pro v2.0 (User Token Edition)');
   logger.info(`🔧 Mode: ${process.env.NODE_ENV === 'production' ? 'Production' : 'Development'}`);
-  logger.info(`⚡ Latency target: 35-55ms (proxyless direct)`);
+  logger.info(`👤 Auth: User Token`);
   logger.info('');
 
   try {
@@ -69,7 +74,7 @@ async function main() {
     logger.info(`✅ Server listening on port ${process.env.PORT || 3001}`);
 
     startWorker();
-    logger.info('✅ Worker pool started (proxyless direct mode)');
+    logger.info('✅ Worker pool started');
 
     startPoller();
     logger.info('✅ Vanity poller started');
