@@ -80,9 +80,80 @@ function updateLatencyStats(latency) {
   stats.p99Latency = sorted[Math.floor(sorted.length * 0.99)] || 0;
 }
 
+async function sendWebhook(status, vanity, message, details = {}) {
+  const webhookUrl = process.env.WEBHOOK_URL;
+  if (!webhookUrl) return;
+
+  const statusColors = {
+    success: 3066993,  // Green
+    failed: 15158332,  // Red
+    ratelimit: 16776960,  // Yellow
+    delayed: 16755200,  // Orange
+  };
+
+  const embed = {
+    color: statusColors[status] || 9807270,
+    title: `🎯 Vanity Claim: ${status.toUpperCase()}`,
+    description: message,
+    fields: [
+      {
+        name: '📝 Vanity',
+        value: `\`${vanity}\``,
+        inline: true,
+      },
+      {
+        name: '⏱️ Timestamp',
+        value: new Date().toISOString(),
+        inline: true,
+      },
+    ],
+    footer: {
+      text: 'Discord Vanity Sniper Pro',
+    },
+  };
+
+  if (details.latency) {
+    embed.fields.push({
+      name: '⏰ Latency',
+      value: `${details.latency}ms`,
+      inline: true,
+    });
+  }
+
+  if (details.error) {
+    embed.fields.push({
+      name: '❌ Error',
+      value: `\`\`\`${details.error}\`\`\``,
+      inline: false,
+    });
+  }
+
+  if (details.retryAfter) {
+    embed.fields.push({
+      name: '⏳ Retry After',
+      value: `${details.retryAfter}s`,
+      inline: true,
+    });
+  }
+
+  try {
+    await axios.post(webhookUrl, {
+      embeds: [embed],
+    });
+  } catch (err) {
+    logger.warn(`⚠️ Failed to send webhook: ${err.message}`);
+  }
+}
+
 async function claimVanity(vanity) {
   if (!targetGuildId) {
     logger.error('❌ DISCORD_GUILD_ID is missing; cannot claim vanity on any guild');
+    return false;
+  }
+
+  const userToken = process.env.DISCORD_USER_TOKEN;
+  if (!userToken) {
+    logger.error('❌ DISCORD_USER_TOKEN is missing; cannot claim vanity');
     return false;
   }
 
@@ -96,11 +167,9 @@ async function claimVanity(vanity) {
       { code: vanity },
       {
         headers: {
-          Authorization: `Bot ${process.env.DISCORD_TOKEN}`,
+          Authorization: userToken,
           'Content-Type': 'application/json',
-          'User-Agent': 'DiscordVanitySniperPro/2.0-safe',
-          'Accept-Encoding': 'gzip, deflate',
-          Connection: 'keep-alive',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         },
         decompress: true,
       }
@@ -119,6 +188,11 @@ async function claimVanity(vanity) {
       stats.successful++;
       logClaim(vanity, true, latency, 'SUCCESS');
       logger.info(`🚀 ✅ Claim SUCCESS in ${latency}ms: ${vanity}`);
+      
+      await sendWebhook('success', vanity, `Vanity URL claimed successfully!`, {
+        latency,
+      });
+      
       markProcessed(vanity);
       return true;
     }
@@ -129,6 +203,12 @@ async function claimVanity(vanity) {
       stats.rateLimited++;
       stats.failed++;
       logger.warn(`⏱️ 429 Rate Limited (${latency}ms): ${vanity}. Backoff ${Math.ceil(waitMs / 1000)}s`);
+      
+      await sendWebhook('ratelimit', vanity, `Rate limited! Will retry after delay.`, {
+        latency,
+        retryAfter,
+      });
+      
       recordFailure(vanity);
       return null;
     }
@@ -137,30 +217,54 @@ async function claimVanity(vanity) {
       stats.failed++;
       logger.warn(`⚠️ 409 Conflict - Vanity already taken (${latency}ms): ${vanity}`);
       logClaim(vanity, false, latency, 'CONFLICT_409');
+      
+      await sendWebhook('failed', vanity, `Vanity already taken by someone else.`, {
+        latency,
+        error: '409 Conflict',
+      });
+      
       markProcessed(vanity);
       return false;
     }
 
     if (status === 401) {
       stats.failed++;
-      logger.error(`❌ 401 Unauthorized (${latency}ms): Invalid or expired bot token`);
+      logger.error(`❌ 401 Unauthorized (${latency}ms): Invalid or expired user token`);
       logClaim(vanity, false, latency, 'AUTH_FAILED_401');
+      
+      await sendWebhook('failed', vanity, `Authentication failed! User token may be invalid or expired.`, {
+        latency,
+        error: '401 Unauthorized - Invalid/expired token',
+      });
+      
       markProcessed(vanity);
       return false;
     }
 
     if (status === 403) {
       stats.failed++;
-      logger.error(`❌ 403 Forbidden (${latency}ms): Bot lacks "Manage Guild" permission on guild ${targetGuildId}`);
+      logger.error(`❌ 403 Forbidden (${latency}ms): User lacks permissions`);
       logClaim(vanity, false, latency, 'FORBIDDEN_403');
+      
+      await sendWebhook('failed', vanity, `Access forbidden! User may not have permissions on this guild.`, {
+        latency,
+        error: '403 Forbidden',
+      });
+      
       markProcessed(vanity);
       return false;
     }
 
     if (status === 404) {
       stats.failed++;
-      logger.error(`❌ 404 Not Found (${latency}ms): Guild ${targetGuildId} not found or bot not in guild`);
+      logger.error(`❌ 404 Not Found (${latency}ms): Guild ${targetGuildId} not found`);
       logClaim(vanity, false, latency, 'GUILD_NOT_FOUND_404');
+      
+      await sendWebhook('failed', vanity, `Guild not found! Invalid DISCORD_GUILD_ID.`, {
+        latency,
+        error: '404 Not Found',
+      });
+      
       markProcessed(vanity);
       return false;
     }
@@ -169,6 +273,12 @@ async function claimVanity(vanity) {
       stats.failed++;
       logger.error(`❌ 400 Permission Error (50013) (${latency}ms): ${vanity}`);
       logClaim(vanity, false, latency, 'MISSING_PERMS_50013');
+      
+      await sendWebhook('failed', vanity, `Permission error! User may lack required permissions.`, {
+        latency,
+        error: '400 Missing Permissions (50013)',
+      });
+      
       markProcessed(vanity);
       return false;
     }
@@ -176,6 +286,12 @@ async function claimVanity(vanity) {
     if (status >= 500) {
       stats.failed++;
       logger.warn(`⚠️ ${status} Server Error (${latency}ms): ${vanity}`);
+      
+      await sendWebhook('delayed', vanity, `Discord server error (${status}). Will retry.`, {
+        latency,
+        error: `${status} Server Error`,
+      });
+      
       recordFailure(vanity);
       return null;
     }
@@ -183,6 +299,12 @@ async function claimVanity(vanity) {
     stats.failed++;
     logger.error(`❌ API Error ${status} (${latency}ms): ${vanity} - ${data.message || 'unknown'}`);
     logClaim(vanity, false, latency, `API_ERROR_${status}`);
+    
+    await sendWebhook('failed', vanity, `API error occurred (${status})`, {
+      latency,
+      error: `${status} ${data.message || 'Unknown'}`,
+    });
+    
     markProcessed(vanity);
     return false;
   } catch (err) {
@@ -190,34 +312,41 @@ async function claimVanity(vanity) {
     updateLatencyStats(latency);
     stats.failed++;
 
+    let errorType = 'Unknown Error';
+    let retryable = true;
+
     if (err.code === 'ECONNREFUSED') {
-      logger.warn(`⏱️ Connection refused (${latency}ms): ${vanity} - Discord API unreachable`);
-      recordFailure(vanity);
-      return null;
-    }
-
-    if (err.code === 'ETIMEDOUT') {
+      logger.warn(`⏱️ Connection refused (${latency}ms): ${vanity}`);
+      errorType = 'Connection Refused';
+    } else if (err.code === 'ETIMEDOUT') {
       logger.warn(`⏱️ Request timeout (${latency}ms): ${vanity}`);
-      recordFailure(vanity);
-      return null;
-    }
-
-    if (err.code === 'ENOTFOUND') {
+      errorType = 'Request Timeout';
+    } else if (err.code === 'ENOTFOUND') {
       logger.warn(`⏱️ DNS error (${latency}ms): ${vanity}`);
-      recordFailure(vanity);
-      return null;
-    }
-
-    if (err.code === 'ERR_HTTP2_STREAM_DESTROYED' || err.code === 'ERR_TLS_ALERT') {
+      errorType = 'DNS Error';
+    } else if (err.code === 'ERR_HTTP2_STREAM_DESTROYED' || err.code === 'ERR_TLS_ALERT') {
       logger.warn(`⚠️ Connection reset (${latency}ms): ${vanity}`);
-      recordFailure(vanity);
-      return null;
+      errorType = 'Connection Reset';
+    } else {
+      logger.error(`❌ Claim error (${latency}ms): ${vanity} - ${err.message}`);
+      errorType = err.message;
+      retryable = false;
     }
 
-    logger.error(`❌ Claim error (${latency}ms): ${vanity} - ${err.message}`);
     logClaim(vanity, false, latency, 'CLIENT_ERROR');
-    markProcessed(vanity);
-    return false;
+    
+    await sendWebhook('delayed', vanity, `Connection error occurred. Will retry.`, {
+      latency,
+      error: errorType,
+    });
+
+    if (retryable) {
+      recordFailure(vanity);
+      return null;
+    } else {
+      markProcessed(vanity);
+      return false;
+    }
   }
 }
 
@@ -226,13 +355,14 @@ function startWorker() {
   isRunning = true;
 
   const concurrency = parseInt(process.env.WORKER_CONCURRENCY || '2');
-  const hasToken = !!process.env.DISCORD_TOKEN;
+  const hasToken = !!process.env.DISCORD_USER_TOKEN;
 
   logger.info(`🔄 Worker Pool Config:`);
   logger.info(`   Concurrency: ${concurrency}`);
   logger.info(`   Requests/sec: ${parseInt(process.env.REQUESTS_PER_SECOND || '2')}`);
-  logger.info(`   Bot Token: ${hasToken ? '✅ Set' : '❌ MISSING'}`);
+  logger.info(`   User Token: ${hasToken ? '✅ Set' : '❌ MISSING'}`);
   logger.info(`   Guild ID: ${process.env.DISCORD_GUILD_ID || '❌ MISSING'}`);
+  logger.info(`   Webhook: ${process.env.WEBHOOK_URL ? '✅ Set' : '⏭️ Disabled'}`);
 
   setInterval(async () => {
     const item = takeNext();
@@ -257,10 +387,10 @@ function startWorker() {
 
   setInterval(() => {
     const rateLimitStatus = rateLimiter.getStatus();
-    const rlInfo = rateLimitStatus.rateLimited 
-      ? `⏱️ THROTTLED (reset in ${Math.ceil(rateLimitStatus.resetIn / 1000)}s)` 
+    const rlInfo = rateLimitStatus.rateLimited
+      ? `⏱️ THROTTLED (reset in ${Math.ceil(rateLimitStatus.resetIn / 1000)}s)`
       : '✅ OK';
-    
+
     logger.info(
       `📊 Worker Stats: Avg ${stats.avgLatency}ms | P95 ${stats.p95Latency}ms | P99 ${stats.p99Latency}ms | ` +
       `Success ${stats.successful} | Failed ${stats.failed} | RateLimited ${stats.rateLimited} | ` +
